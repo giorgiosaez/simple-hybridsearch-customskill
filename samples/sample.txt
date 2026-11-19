@@ -1,0 +1,14 @@
+Practical energy improvements
+
+A facilities team can reduce energy use by measuring a baseline before changing
+equipment settings. Compare occupied and unoccupied periods, review unusual
+overnight demand, and check that heating and cooling schedules match actual use.
+
+Artificial intelligence can help identify unusual patterns in meter readings.
+People should investigate each recommendation and verify comfort, safety, and
+operational requirements before approving a change.
+
+Measure the result against the baseline. Record the assumptions, keep a rollback
+plan, and review whether the improvement continues over time.
+
+This original demonstration text is covered by the repository's MIT license.
