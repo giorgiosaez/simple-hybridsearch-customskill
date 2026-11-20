@@ -48,7 +48,7 @@ modes, not API-key-only).
 | Deployment operator | Resource-creation permissions plus permission to assign those runtime roles; Contributor alone cannot assign roles |
 
 Wait for role propagation before retrying access. Script 04 does not enable
-identities, grant roles, or change networking. The optional Function key and
+identities, grant roles, or change networking. The Function key and optional
 billable AI Services key are secrets, not substitutes for these permissions.
 
 ## Verify each stage
@@ -69,6 +69,33 @@ billable AI Services key are secrets, not substitutes for these permissions.
    verify vector/hybrid retrieval too.
 
 Local validation does not certify live network access or production scale.
+
+## Master workflow status and failures
+
+[run_all.ps1](../run_all.ps1) delegates to the numbered examples rather than
+duplicating their upload, schema, deployment, or query code. `-WhatIf` prints
+the plan only. A normal run confirms once before changing local/Azure resources.
+It preserves an existing `.env`; a missing one is collected through step 00.
+
+The master disables an existing indexer's schedule before upload/deployment and
+waits for its active run; disabling is not cancellation. Step 04 re-enables it.
+Step 05 with `--wait` waits for existing work, requests another run, and requires
+a distinct execution with success and no errors, failed items, or warnings.
+Polling prints phase messages and counts, never raw service-error messages,
+keys, Blob paths, or metadata IDs. The final search intentionally prints passages.
+Review warnings in Azure execution history; they are not silently ignored.
+
+If any step fails, the terminal shows the failed phase and the script exits
+unsuccessfully. Earlier resource writes and uploads persist. Before step 04,
+an indexer may remain paused; after step 04, its daily schedule can remain
+enabled even if polling times out. A polling timeout does not cancel Azure work.
+Inspect status before retrying, and resume/reconfigure only once the Function
+is healthy. No automatic index reset, deletion, or rollback is performed.
+
+The two Function settings written by successful deployment are refreshed in the
+current process as well as `.env`, preventing stale process keys from overriding
+the newly deployed endpoint/key in the following step. Other existing process
+settings still take precedence over `.env`; check them before starting.
 
 ## Deployment failures
 
@@ -142,5 +169,8 @@ independently; the Windows constraints do not lock that environment.
   reviewed candidate tree with `gitleaks dir <candidate-directory> --redact`.
   Do not scan or publish a populated working tree containing private files.
 - Replace environment-specific URLs/IDs with placeholders in examples.
+- Review Git author/committer metadata too: secret scanners do not treat personal
+  email addresses as credentials. Use the account's GitHub noreply address when
+  personal-email disclosure is not intended.
 - Do not publish Function keys or deployment bundles containing settings.
 - Keep operational limitations documented, not as undisclosed workarounds.

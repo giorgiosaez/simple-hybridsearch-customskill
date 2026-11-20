@@ -60,6 +60,39 @@ variables take precedence over the local configuration file.
 | 05 | [05_run_indexer.py](rag_search/05_run_indexer.py) | Optional: request an extra run |
 | 06 | [06_search.py](rag_search/06_search.py) | Search after indexing completes |
 
+### Run the whole workflow
+
+The [master script](run_all.ps1) calls the numbered scripts in order and prints
+timestamped `RUNNING`, `OK`, `SKIPPED`, `FAILED`, and `COMPLETE` messages. Define
+the `$deployment` parameters shown in step 3 below, then run:
+
+```powershell
+# Print the plan only: no installation, configuration changes, or Azure calls.
+.\run_all.ps1 @deployment -WhatIf
+# Run after reviewing the plan; asks for confirmation before making changes.
+.\run_all.ps1 @deployment
+# Alternatively, use an already-approved Blob with tenant/file metadata:
+.\run_all.ps1 @deployment -SkipUpload
+```
+
+The master script prepares a missing virtual environment and dependencies,
+prompts through step 00 only if `.env` does not exist, performs deployment
+preflight, pauses any existing indexer and waits until idle, and runs steps 01
+through 06. It uses the repository as its working directory regardless of where
+it is invoked. Install Python and Azure CLI and run `az login` first.
+
+Step 04 can start indexing immediately. The master waits for active work, then
+uses step 05 to request and verify a new run before searching. Failed items,
+execution errors, warnings, or a timeout stop the workflow. Each indexer wait
+has a 30-minute deadline; override with `-TimeoutSeconds 3600`. A zero-item run
+is reported explicitly and does not prove that the intended document was indexed.
+The workflow does not reset change tracking or roll back earlier changes.
+An indexer paused before a failure can remain disabled; investigate before retrying.
+Review the accepted container: indexing processes all eligible Blobs, not only
+the uploaded file. Do not run competing indexing/deployment workflows.
+
+The sections below explain the same steps individually.
+
 ### 1. Install and configure
 
 ```powershell
@@ -150,6 +183,9 @@ Configuration success is not indexing success. For an extra run only:
 ```
 
 Script 05 submits an asynchronous request; it does not wait for completion.
+Use `--wait --timeout-seconds 1800` to wait for a new successful run, or
+`--pause --timeout-seconds 1800` to disable the indexer and wait until idle.
+Pause reports explicitly if no indexer exists. Neither option resets the index.
 See [verification and troubleshooting](docs/operations.md#verify-each-stage).
 
 ### 5. Search
@@ -167,9 +203,6 @@ and apply authorization on every query; a caller-supplied tenant ID is not enoug
 
 ## Limits and maintenance
 
-- Text PDFs, UTF-8 text/Markdown, and HTML only; no OCR or Office parsing.
-- Default limits: 25 MiB, 50 pages, and token-bounded chunks. Any textless PDF page
-  fails. The managed custom-skill timeout is 230 seconds.
 - Large-document processing, private networking, identity-based host storage,
   and safe identity-migration cleanup remain future work. See the
   [operational limits](docs/operations.md#known-limitations).
@@ -178,7 +211,7 @@ and apply authorization on every query; a caller-supplied tenant ID is not enoug
 
 ## What is published
 
-This minimal repository contains the managed-route scripts, Function source,
+This minimal repository contains the master and managed-route scripts, Function source,
 dependency files, configuration example, short operations guide, license, and
 original sample document. The explicit [.gitignore](.gitignore) allowlist excludes
 private configuration, customer data, local deployment notes, notebooks, tests,

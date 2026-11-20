@@ -9,6 +9,7 @@
 !/constraints.txt
 !/00_configure_environment.ps1
 !/03_deploy_custom_skill.ps1
+!/run_all.ps1
 
 !/rag_search/
 /rag_search/*

@@ -290,6 +290,8 @@ set_key(path, "AZURE_SEARCH_CUSTOM_SKILL_ENDPOINT", os.environ["RAG_DEPLOY_SKILL
 set_key(path, "AZURE_SEARCH_CUSTOM_SKILL_KEY", os.environ["RAG_DEPLOY_SKILL_KEY"])
 '@ | & $python -
     if ($LASTEXITCODE -ne 0) { throw 'Function deployed, but local .env update failed.' }
+    $env:AZURE_SEARCH_CUSTOM_SKILL_ENDPOINT = $env:RAG_DEPLOY_SKILL_ENDPOINT
+    $env:AZURE_SEARCH_CUSTOM_SKILL_KEY = $env:RAG_DEPLOY_SKILL_KEY
     Write-Host 'Custom skill deployed; endpoint and key saved to .env without printing the key.'
     Write-Host 'No documents were processed. Allow RBAC propagation, then run script 04 to apply the enriched pipeline.'
     Write-Host 'Existing documents require explicit reset/reprocessing. Source tenant and file_id metadata are mandatory.'
