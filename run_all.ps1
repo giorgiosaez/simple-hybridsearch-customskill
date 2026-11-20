@@ -90,7 +90,8 @@ try {
         & python -m venv (Join-Path $PSScriptRoot '.venv')
         if ($LASTEXITCODE -ne 0) { throw 'Creating .venv failed. Install Python 3.12 and retry.' }
     }
-    Invoke-Python -Arguments @('-c', 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else "Python 3.12 or newer is required")')
+    & $python -c 'import sys; sys.exit(sys.version_info < (3, 12))'
+    if ($LASTEXITCODE -ne 0) { throw 'Python 3.12 or newer is required.' }
     & $python -c 'import azure.functions, azure.identity, azure.search.documents, azure.storage.blob, azure.ai.textanalytics, openai, pypdf, bs4, tiktoken, dotenv'
     if ($LASTEXITCODE -ne 0) {
         Write-Status 'RUNNING' 'Installing missing project dependencies'
