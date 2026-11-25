@@ -7,15 +7,15 @@
 !/LICENSE
 !/pyproject.toml
 !/constraints.txt
-!/00_configure_environment.ps1
-!/03_deploy_custom_skill.ps1
 !/run_all.ps1
 
 !/rag_search/
 /rag_search/*
 !/rag_search/__init__.py
+!/rag_search/00_configure_environment.ps1
 !/rag_search/01_upload_document.py
 !/rag_search/02_create_index.py
+!/rag_search/03_deploy_custom_skill.ps1
 !/rag_search/04_create_indexer.py
 !/rag_search/05_run_indexer.py
 !/rag_search/06_search.py
@@ -34,6 +34,7 @@
 !/samples/
 /samples/*
 !/samples/sample.txt
+!/samples/sample.pdf
 
 # Never publish local settings, customer data, or generated files.
 .env
