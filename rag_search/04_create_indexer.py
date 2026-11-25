@@ -51,6 +51,37 @@ from azure.search.documents.indexes.models import (
 from dotenv import load_dotenv
 from openai import APIError, OpenAI
 
+# Search builds a tree of values for every Blob it processes. Each skill reads from
+# the tree and writes new values back into it. The tree this pipeline creates:
+#
+#   /document                                  one Blob
+#     /file_data                               original bytes (Search provides this)
+#     /file_id, /<tenant field>                trusted Blob metadata (Search provides this)
+#     /pages/*                                 one entry per physical page (Layout)
+#       /content                               the whole page text (Layout)
+#       /locationMetadata/pageNumber           the page number (Layout)
+#       /identified_content                    the page text, only if the Blob has IDs (guard)
+#       /embeddings                            whole-page vector (page embedding)
+#       /summary                               whole-page summary (summary Function)
+#       /chunk_texts/*                         chunk strings (Text Split)
+#       /chunks/*                              one entry per chunk (numbering Function)
+#         /content, /number                    chunk text and its number
+#         /embeddings                          chunk vector (chunk embedding)
+#         /detected_language                   language code (Language Detection)
+#         /language_metadata/codes/*           the code as a collection (Shaper)
+PAGE = "/document/pages/*"
+CHUNK = "/document/pages/*/chunks/*"
+
+
+def skill_input(name: str, source: str) -> InputFieldMappingEntry:
+    """Describe one value a skill reads: its input name and where it lives in the tree."""
+    return InputFieldMappingEntry(name=name, source=source)
+
+
+def skill_output(name: str, target_name: str) -> OutputFieldMappingEntry:
+    """Describe one value a skill writes: its output name and the tree name it is stored as."""
+    return OutputFieldMappingEntry(name=name, target_name=target_name)
+
 
 class InputError(ValueError):
     """A validation message safe for operational output."""
@@ -271,31 +302,35 @@ def build_index_projection(
 ) -> SearchIndexerIndexProjection:
     """Map enriched chunk values to index fields, including the languages collection.
 
+    The projection context is CHUNK, so Search writes one index document per chunk.
+    A "*" path therefore resolves to that chunk's own value, while shorter paths such
+    as /document/file_id are repeated on every chunk. This is how every chunk
+    receives its page's content, summary and vector.
+
     Search creates chunk_id and parent_id itself. Only chunks become index
     documents; the parent Blob record is not indexed as a separate document.
     """
+    # fmt: off
     field_mappings = [
-        InputFieldMappingEntry(name="tenant_id", source=f"/document/{tenant_metadata_field}"),
-        InputFieldMappingEntry(name="file_id", source="/document/file_id"),
-        InputFieldMappingEntry(
-            name="page_number", source="/document/pages/*/locationMetadata/pageNumber"
-        ),
-        InputFieldMappingEntry(name="chunk_number", source="/document/pages/*/chunks/*/number"),
-        InputFieldMappingEntry(name="chunk_content", source="/document/pages/*/chunks/*/content"),
-        InputFieldMappingEntry(name="page_summary", source="/document/pages/*/summary"),
-        InputFieldMappingEntry(name="page_content", source="/document/pages/*/content"),
-        InputFieldMappingEntry(name="embeddings", source="/document/pages/*/chunks/*/embeddings"),
-        InputFieldMappingEntry(name="page_embeddings", source="/document/pages/*/embeddings"),
-        InputFieldMappingEntry(
-            name="languages", source="/document/pages/*/chunks/*/language_metadata/codes/*"
-        ),
+        # Index field        Value in the enrichment tree
+        skill_input("tenant_id",       f"/document/{tenant_metadata_field}"),
+        skill_input("file_id",         "/document/file_id"),
+        skill_input("page_number",     f"{PAGE}/locationMetadata/pageNumber"),
+        skill_input("chunk_number",    f"{CHUNK}/number"),
+        skill_input("chunk_content",   f"{CHUNK}/content"),
+        skill_input("page_summary",    f"{PAGE}/summary"),
+        skill_input("page_content",    f"{PAGE}/content"),
+        skill_input("embeddings",      f"{CHUNK}/embeddings"),
+        skill_input("page_embeddings", f"{PAGE}/embeddings"),
+        skill_input("languages",       f"{CHUNK}/language_metadata/codes/*"),
     ]
+    # fmt: on
     return SearchIndexerIndexProjection(
         selectors=[
             SearchIndexerIndexProjectionSelector(
                 target_index_name=index_name,
                 parent_key_field_name="parent_id",
-                source_context="/document/pages/*/chunks/*",
+                source_context=CHUNK,
                 mappings=field_mappings,
             )
         ],
@@ -376,18 +411,11 @@ def build_enrichment_skillset(
 ) -> SearchIndexerSkillset:
     """Define document enrichment and its index mappings, without making Azure requests.
 
-    Pipeline, in order:
-      1. Document Layout extracts one text section per physical page.
-      2. The identity guard releases page text only when tenant and file IDs exist.
-      3. Page embedding and the summary Function work on the whole page.
-      4. Text Split cuts each page into overlapping chunks.
-      5. The numbering Function (same app as the summary) numbers each page's chunks.
-      6. Chunk embedding, language detection and a Shaper (which wraps the single
-         language code in a collection) enrich every chunk.
-    The index projection then writes one search document per chunk.
-
-    Layout receives Search's original file reference directly, because routing it
-    through a Conditional skill would lose the type Layout needs.
+    Each Blob is enriched in six steps, written below in the order they run:
+    extract pages, require identity, process each whole page, split pages into
+    chunks, number the chunks, and enrich each chunk. The index projection then
+    writes one search document per chunk. The enrichment tree at the top of this
+    file shows what each step reads and writes.
     """
     validate_tenant_metadata_field(tenant_metadata_field)
     check_function_skill(custom_skill_endpoint, custom_skill_key)
@@ -397,24 +425,9 @@ def build_enrichment_skillset(
         openai_endpoint, embedding_model, embedding_size, embedding_deployment
     )
 
-    # Guard text, not Search's special file reference, which must reach Layout unchanged.
-    identity_guard = ConditionalSkill(
-        name="require-blob-identity",
-        context="/document/pages/*",
-        inputs=[
-            InputFieldMappingEntry(
-                name="condition",
-                source=(
-                    f"= $(/document/{tenant_metadata_field}) != null && "
-                    f"$(/document/{tenant_metadata_field}) != '' && "
-                    "$(/document/file_id) != null && $(/document/file_id) != ''"
-                ),
-            ),
-            InputFieldMappingEntry(name="whenTrue", source="/document/pages/*/content"),
-            InputFieldMappingEntry(name="whenFalse", source="= null"),
-        ],
-        outputs=[OutputFieldMappingEntry(name="output", target_name="identified_content")],
-    )
+    # --- Step 1: extract pages -------------------------------------------------------
+    # Layout gets Search's original file reference directly. It writes one entry per
+    # physical page into /document/pages, each with its text and page number.
     layout_skill = DocumentIntelligenceLayoutSkill(
         name="extract-full-pages",
         context="/document",
@@ -423,87 +436,114 @@ def build_enrichment_skillset(
         # SDK default is markdown-only and Azure rejects it for text output.
         markdown_header_depth=None,  # type: ignore[arg-type]
         extraction_options=["locationMetadata"],
-        inputs=[InputFieldMappingEntry(name="file_data", source="/document/file_data")],
-        outputs=[OutputFieldMappingEntry(name="text_sections", target_name="pages")],
-    )
-    page_embedding_skill = AzureOpenAIEmbeddingSkill(
-        name="embed-full-page",
-        context="/document/pages/*",
-        resource_url=resource_url,
-        deployment_name=embedding_deployment,
-        model_name=embedding_model,
-        dimensions=embedding_size,
-        inputs=[InputFieldMappingEntry(name="text", source="/document/pages/*/identified_content")],
-        outputs=[OutputFieldMappingEntry(name="embedding", target_name="embeddings")],
-    )
-    split_skill = SplitSkill(
-        name="split-page-text",
-        context="/document/pages/*",
-        text_split_mode="pages",
-        maximum_page_length=split_length,
-        page_overlap_length=split_overlap,
-        inputs=[InputFieldMappingEntry(name="text", source="/document/pages/*/identified_content")],
-        outputs=[
-            OutputFieldMappingEntry(name="textItems", target_name="chunk_texts"),
-        ],
-    )
-    # Native Split outputs parallel arrays; projections cannot pair their sibling values.
-    numbering_skill = WebApiSkill(
-        name="number-page-chunks",
-        context="/document/pages/*",
-        uri=chunk_number_skill_endpoint,
-        http_method="POST",
-        timeout=timedelta(seconds=30),
-        batch_size=1,
-        degree_of_parallelism=1,
-        http_headers={"x-functions-key": chunk_number_skill_key},
-        inputs=[InputFieldMappingEntry(name="texts", source="/document/pages/*/chunk_texts/*")],
-        outputs=[OutputFieldMappingEntry(name="chunks", target_name="chunks")],
-    )
-    embedding_skill = AzureOpenAIEmbeddingSkill(
-        name="embed-chunk-text",
-        context="/document/pages/*/chunks/*",
-        resource_url=resource_url,
-        deployment_name=embedding_deployment,
-        model_name=embedding_model,
-        dimensions=embedding_size,
-        inputs=[InputFieldMappingEntry(name="text", source="/document/pages/*/chunks/*/content")],
-        outputs=[OutputFieldMappingEntry(name="embedding", target_name="embeddings")],
+        inputs=[skill_input("file_data", "/document/file_data")],
+        outputs=[skill_output("text_sections", "pages")],
     )
 
+    # --- Step 2: require identity ----------------------------------------------------
+    # Pass page text on only when the Blob has both a tenant ID and a file ID. Later
+    # skills read identified_content, so a Blob without IDs is never summarized,
+    # embedded, split or indexed. (Guarding the file reference itself would break
+    # Layout, which needs the reference's special type.)
+    both_ids_exist = (
+        f"= $(/document/{tenant_metadata_field}) != null && "
+        f"$(/document/{tenant_metadata_field}) != '' && "
+        "$(/document/file_id) != null && $(/document/file_id) != ''"
+    )
+    identity_guard = ConditionalSkill(
+        name="require-blob-identity",
+        context=PAGE,
+        inputs=[
+            skill_input("condition", both_ids_exist),
+            skill_input("whenTrue", f"{PAGE}/content"),
+            skill_input("whenFalse", "= null"),
+        ],
+        outputs=[skill_output("output", "identified_content")],
+    )
+
+    # --- Step 3: process each whole page ---------------------------------------------
+    # The page vector and the summary describe the entire page. Projection later
+    # repeats them on every chunk of that page.
+    page_embedding_skill = AzureOpenAIEmbeddingSkill(
+        name="embed-full-page",
+        context=PAGE,
+        resource_url=resource_url,
+        deployment_name=embedding_deployment,
+        model_name=embedding_model,
+        dimensions=embedding_size,
+        inputs=[skill_input("text", f"{PAGE}/identified_content")],
+        outputs=[skill_output("embedding", "embeddings")],
+    )
     summary_skill = WebApiSkill(
         name="summarize-full-page",
-        context="/document/pages/*",
+        context=PAGE,
         uri=custom_skill_endpoint,
         http_method="POST",
         http_headers={"x-functions-key": custom_skill_key},
-        timeout=timedelta(seconds=230),
+        timeout=timedelta(seconds=230),  # model calls can be slow
+        batch_size=1,  # the Function accepts exactly one record per request
+        degree_of_parallelism=1,
+        inputs=[skill_input("text", f"{PAGE}/identified_content")],
+        outputs=[skill_output("summary", "summary")],
+    )
+
+    # --- Step 4: split each page into chunks -----------------------------------------
+    # Text Split returns the chunk strings in order, but without numbers.
+    split_skill = SplitSkill(
+        name="split-page-text",
+        context=PAGE,
+        text_split_mode="pages",
+        maximum_page_length=split_length,
+        page_overlap_length=split_overlap,
+        inputs=[skill_input("text", f"{PAGE}/identified_content")],
+        outputs=[skill_output("textItems", "chunk_texts")],
+    )
+
+    # --- Step 5: number the chunks ---------------------------------------------------
+    # Native Split outputs parallel arrays, and projections cannot pair values from
+    # sibling arrays. This small Function (in the same app as the summary) returns
+    # each chunk as one object holding its text and its number.
+    numbering_skill = WebApiSkill(
+        name="number-page-chunks",
+        context=PAGE,
+        uri=chunk_number_skill_endpoint,
+        http_method="POST",
+        http_headers={"x-functions-key": chunk_number_skill_key},
+        timeout=timedelta(seconds=30),
         batch_size=1,
         degree_of_parallelism=1,
-        inputs=[
-            InputFieldMappingEntry(name="text", source="/document/pages/*/identified_content"),
-        ],
-        outputs=[OutputFieldMappingEntry(name="summary", target_name="summary")],
+        inputs=[skill_input("texts", f"{PAGE}/chunk_texts/*")],
+        outputs=[skill_output("chunks", "chunks")],
+    )
+
+    # --- Step 6: enrich each chunk ---------------------------------------------------
+    chunk_embedding_skill = AzureOpenAIEmbeddingSkill(
+        name="embed-chunk-text",
+        context=CHUNK,
+        resource_url=resource_url,
+        deployment_name=embedding_deployment,
+        model_name=embedding_model,
+        dimensions=embedding_size,
+        inputs=[skill_input("text", f"{CHUNK}/content")],
+        outputs=[skill_output("embedding", "embeddings")],
     )
     language_detection_skill = LanguageDetectionSkill(
         name="detect-chunk-language",
-        context="/document/pages/*/chunks/*",
-        inputs=[InputFieldMappingEntry(name="text", source="/document/pages/*/chunks/*/content")],
-        outputs=[OutputFieldMappingEntry(name="languageCode", target_name="detected_language")],
+        context=CHUNK,
+        inputs=[skill_input("text", f"{CHUNK}/content")],
+        outputs=[skill_output("languageCode", "detected_language")],
     )
-    # The detector returns one code; the index's languages field expects a collection.
+    # The detector returns one code, but the index's languages field is a collection,
+    # so Shaper wraps the code in a one-item list.
     language_collection_skill = ShaperSkill(
         name="collect-chunk-language",
-        context="/document/pages/*/chunks/*",
-        inputs=[
-            InputFieldMappingEntry(
-                name="codes",
-                source="=[$(/document/pages/*/chunks/*/detected_language)]",
-            )
-        ],
-        outputs=[OutputFieldMappingEntry(name="output", target_name="language_metadata")],
+        context=CHUNK,
+        inputs=[skill_input("codes", f"=[$({CHUNK}/detected_language)]")],
+        outputs=[skill_output("output", "language_metadata")],
     )
 
+    # Built-in skills are free for 20 documents per indexer per day. With an AI
+    # Services key they are billed to that resource instead.
     billing_account: CognitiveServicesAccountKey | DefaultCognitiveServicesAccount
     if ai_services_key:
         billing_account = CognitiveServicesAccountKey(key=ai_services_key)
@@ -513,14 +553,14 @@ def build_enrichment_skillset(
     return SearchIndexerSkillset(
         name=skillset_name,
         cognitive_services_account=billing_account,
-        skills=[
+        skills=[  # listed in the order they logically run
             layout_skill,
             identity_guard,
             page_embedding_skill,
             summary_skill,
             split_skill,
             numbering_skill,
-            embedding_skill,
+            chunk_embedding_skill,
             language_detection_skill,
             language_collection_skill,
         ],
@@ -542,19 +582,21 @@ def build_indexer(
     """
     return SearchIndexer(
         name=indexer_name,
-        data_source_name=data_source_name,
-        target_index_name=index_name,
-        skillset_name=skillset_name,
-        is_disabled=False,
-        schedule=IndexingSchedule(interval=timedelta(hours=24)),
+        data_source_name=data_source_name,  # where Blobs come from
+        skillset_name=skillset_name,  # how each Blob is enriched
+        target_index_name=index_name,  # where the chunks are written
+        is_disabled=False,  # saving the indexer can start processing right away
+        schedule=IndexingSchedule(interval=timedelta(hours=24)),  # then rerun daily
         parameters=IndexingParameters(
-            batch_size=5,
+            batch_size=5,  # Blobs processed per batch
+            # Fail fast: a single failed Blob stops the run instead of being skipped.
             max_failed_items=0,
             max_failed_items_per_batch=0,
             configuration=IndexingParametersConfiguration(
                 # The SDK types this SQL-only default as str, but Blob requires omission.
                 query_timeout=None,  # type: ignore[arg-type]
                 data_to_extract="contentAndMetadata",
+                # Expose the original file as /document/file_data for Document Layout.
                 allow_skillset_to_read_file_data=True,
                 fail_on_unsupported_content_type=True,
                 fail_on_unprocessable_document=True,
@@ -564,27 +606,40 @@ def build_indexer(
 
 
 def main() -> None:
-    """Validate live schema/model compatibility and create or update the enabled pipeline."""
+    """Validate live schema/model compatibility and create or update the enabled pipeline.
+
+    Steps: 1) read settings, 2) check the existing index and embedding model,
+    3) build all definitions locally, 4) save them to Azure.
+    """
     load_dotenv(".env", override=False)
     for logger_name in ("azure", "openai", "httpx", "httpcore"):
         logging.getLogger(logger_name).setLevel(logging.CRITICAL)
 
+    # 1) Settings. Names of the four Search resources this script creates or updates:
     search_endpoint = read_required_setting("AZURE_SEARCH_ENDPOINT")
-    index_name = read_required_setting("AZURE_SEARCH_INDEX")
+    index_name = read_required_setting("AZURE_SEARCH_INDEX")  # must already exist (script 02)
     data_source_name = read_required_setting("AZURE_SEARCH_DATA_SOURCE_NAME")
     skillset_name = read_required_setting("AZURE_SEARCH_SKILLSET_NAME")
     indexer_name = read_required_setting("AZURE_SEARCH_INDEXER_NAME")
+
+    # The Blob container to read and the metadata key that holds each Blob's tenant ID.
     storage_resource_id = read_required_setting("AZURE_STORAGE_RESOURCE_ID")
     container_name = read_required_setting("AZURE_STORAGE_ACCEPTED_CONTAINER")
     tenant_metadata_field = read_required_setting("AZURE_SEARCH_TENANT_METADATA_FIELD")
     validate_tenant_metadata_field(tenant_metadata_field)
+
+    # Both Functions live in one app, so they share a key but have different routes.
     custom_skill_endpoint = read_required_setting("AZURE_SEARCH_CUSTOM_SKILL_ENDPOINT")
     custom_skill_key = read_required_setting("AZURE_SEARCH_CUSTOM_SKILL_KEY")
     chunk_number_skill_endpoint = read_required_setting("AZURE_SEARCH_CHUNK_NUMBER_SKILL_ENDPOINT")
     chunk_number_skill_key = read_required_setting("AZURE_SEARCH_CHUNK_NUMBER_SKILL_KEY")
+
+    # The embedding model Search calls, and optional billing for built-in skills.
     openai_endpoint = read_required_setting("AZURE_OPENAI_ENDPOINT")
     embedding_deployment = read_required_setting("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
     ai_services_key = os.environ.get("AZURE_AI_SERVICES_KEY", "").strip() or None
+
+    # Chunk size in characters, and how many characters neighboring chunks share.
     try:
         split_length = int(os.environ.get("AZURE_SEARCH_SPLIT_LENGTH", "5000"))
         split_overlap = int(os.environ.get("AZURE_SEARCH_SPLIT_OVERLAP", "750"))
@@ -610,12 +665,14 @@ def main() -> None:
         ) as openai_client,
         SearchIndexerClient(search_endpoint, credential) as indexer_client,
     ):
+        # 2) Read the existing index and test the embedding model before changing anything.
         index = index_client.get_index(index_name)
         index_embedding_size = validate_index_for_projections(index)
         model_name = probe_embedding_model(
             openai_client, embedding_deployment, index_embedding_size, configured_embedding_size
         )
-        # Build every definition before saving any resource, so invalid input stops all writes.
+
+        # 3) Build every definition before saving any resource, so invalid input stops all writes.
         data_source = build_blob_data_source(
             data_source_name=data_source_name,
             storage_resource_id=storage_resource_id,
@@ -643,7 +700,9 @@ def main() -> None:
             skillset_name=skillset_name,
             index_name=index_name,
         )
-        # Create dependencies first. A later failure does not roll back earlier updates.
+        # 4) Save in dependency order: the indexer needs the data source and skillset.
+        # A later failure does not roll back earlier updates. Saving the indexer can
+        # start processing immediately.
         indexer_client.create_or_update_data_source_connection(data_source)
         indexer_client.create_or_update_skillset(skillset)
         indexer_client.create_or_update_indexer(indexer)

@@ -144,52 +144,44 @@ def build_index(index_name: str, embedding_size: int) -> SearchIndex:
     if embedding_size <= 0:
         raise InputError("Vector dimensions must be positive")
 
-    # Field definitions are like database columns, not actual document values.
-    fields = [
-        # Blob identifiers and Search-generated keys
-        SearchableField(
-            name="chunk_id",
-            type=SearchFieldDataType.String,
-            key=True,
-            filterable=True,
-            analyzer_name="keyword",
-        ),
-        SimpleField(name="parent_id", type=SearchFieldDataType.String, filterable=True),
-        SimpleField(name="tenant_id", type=SearchFieldDataType.String, filterable=True),
-        SimpleField(name="file_id", type=SearchFieldDataType.String, filterable=True),
-        SimpleField(
-            name="page_number",
-            type=SearchFieldDataType.Int32,
-            filterable=True,
-            sortable=True,
-        ),
-        SimpleField(
-            name="chunk_number",
-            type=SearchFieldDataType.Int32,
-            filterable=True,
-            sortable=True,
-        ),
-        # Text and language metadata
-        SearchableField(name="chunk_content", type=SearchFieldDataType.String),
-        SearchableField(name="page_summary", type=SearchFieldDataType.String),
-        SimpleField(name="page_content", type=SearchFieldDataType.String),
-        SimpleField(
-            name="languages",
-            type=SearchFieldDataType.Collection(SearchFieldDataType.String),
-            filterable=True,
-            facetable=True,
-        ),
-    ]
+    String = SearchFieldDataType.String
+    Int = SearchFieldDataType.Int32
+    Strings = SearchFieldDataType.Collection(SearchFieldDataType.String)
+    Floats = SearchFieldDataType.Collection(SearchFieldDataType.Single)
 
+    # Field definitions are like database columns, not actual document values.
+    # Searchable text uses SearchableField; plain stored values use SimpleField.
+    # fmt: off
+    fields = [
+        # Keys. Search generates chunk_id and parent_id when it projects each chunk.
+        SearchableField(name="chunk_id",      type=String, key=True, filterable=True, analyzer_name="keyword"),
+        SimpleField(    name="parent_id",     type=String, filterable=True),
+
+        # Blob identity, from trusted Blob metadata
+        SimpleField(    name="tenant_id",     type=String, filterable=True),
+        SimpleField(    name="file_id",       type=String, filterable=True),
+
+        # Position of the chunk inside the source document
+        SimpleField(    name="page_number",   type=Int,    filterable=True, sortable=True),
+        SimpleField(    name="chunk_number",  type=Int,    filterable=True, sortable=True),
+
+        # Chunk text and its language codes
+        SearchableField(name="chunk_content", type=String),
+        SimpleField(    name="languages",     type=Strings, filterable=True, facetable=True),
+
+        # The whole source page, repeated on each of its chunks
+        SearchableField(name="page_summary",  type=String),
+        SimpleField(    name="page_content",  type=String),
+    ]
+    # fmt: on
+
+    # Chunk and page vectors share one algorithm profile; hidden keeps them out of results.
     for vector_name in ("embeddings", "page_embeddings"):
         fields.append(
             SearchField(
                 name=vector_name,
-                type=SearchFieldDataType.Collection(SearchFieldDataType.Single),
+                type=Floats,
                 searchable=True,
-                filterable=False,
-                sortable=False,
-                facetable=False,
                 hidden=True,
                 vector_search_dimensions=embedding_size,
                 vector_search_profile_name=VECTOR_PROFILE_NAME,
