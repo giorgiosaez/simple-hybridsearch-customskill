@@ -2,7 +2,7 @@
 
 `simple-hybridsearch-customskill` is a readable Azure AI Search example.
 
-Upload an approved document, extract and enrich its pages, and retrieve relevant
+Upload an approved document, summarize its full pages, and retrieve relevant
 passages with keyword, vector, or hybrid search. Each numbered script is intended
 to be read and run independently, without a shared application framework.
 
@@ -13,19 +13,76 @@ passages. It does not enforce end-user authorization.
 ```text
 Approved document -> Blob content + tenant/file metadata
                          |
-                  Managed indexer (04)
+                  Blob indexer: content + metadata (04)
                          |
-                  Enrichment Function
+                  Search Document Layout: full physical pages
                          |
-                  Azure AI Search
+                  Page embedding skill + summary-only Function
+                         |
+                  Search Text Split: 5,000 / 750 characters
+                         |
+                  Numbering function in the same app: {content, number}
+                         |
+                  Chunk embedding skill
+                         |
+                  Language Detection + Shaper
+                         |
+                  Index projections: text, summary, vectors, metadata
                          |
                   Search example (06)
 ```
 
-This walkthrough uses managed indexing. The Function packages
-[alternative_ingest_document.py](rag_search/alternative_ingest_document.py) as
-`ingestion.py` to reuse its extraction, chunking, and enrichment functions. Keep
-that source file: it is a deployment dependency, not an extra step to run.
+The **indexer reads Blob file data and tenant/file metadata**. Search's Document
+Layout skill extracts full-page text without additional Layout chunking. Search
+embeds each full page, splits each page, embeds its chunks, detects language, and
+projects the results into the index.
+The **summary Function only summarizes**: it accepts `{"text": "full page text"}` and returns
+`{"summary": "short summary"}` inside the custom-skill record envelope.
+It does not download documents, read metadata, split text, or generate vectors.
+
+A small [numbering function](custom_skill/function_app.py) in the same Function App only
+turns Search's already-split strings into `{content, number}` objects. Text Split
+returns text and ordinals in separate arrays; native projections do not pair
+sibling arrays into one scalar number per chunk. Keeping the number attached to
+its text avoids that failure without reimplementing Search's splitting.
+
+For teaching, both HTTP handlers follow **read -> process -> respond**:
+`read_record` validates the Search request, `build_record_result` handles the
+operation and record-level errors, and `enrich` returns the HTTP response.
+The summary function calls `summarize_record`; the numbering function calls
+`number_record` and `build_numbering_result`. Both reuse `read_record` in the same
+file and deployment package. The summary route stays `/api/enrich`; numbering
+uses `/api/number-chunks`. Only the summary function calls the model.
+
+Each chunk retains its **physical PDF `page_number`**, supplied by Document Layout's
+location metadataâ€”not by counting chunks. Multiple chunks can belong to the same page.
+Text Split uses a maximum of **5,000 characters** and **750-character overlap**.
+It prefers sentence boundaries, so actual chunks can be shorter than the maximum.
+Existing `.env` or process settings override these defaults; update old values
+before running the workflow.
+### Required index contract
+
+All eleven fields below are mandatory. Simplifying ingestion must not remove
+them or replace page-level values with chunk-level values.
+
+| Field | Required meaning |
+|---|---|
+| `tenant_id` | Trusted tenant ID from Blob metadata |
+| `file_id` | Stable file ID from Blob metadata |
+| `page_number` | One-based physical PDF page number |
+| `chunk_number` | One-based consecutive number within a physical page; restarts at 1 on each page |
+| `chunk_content` | Text of this chunk |
+| `chunk_id` | Unique index key for this chunk |
+| `page_summary` | Summary of the entire source page, shared by its chunks |
+| `embeddings` | Embedding of this chunk's content |
+| `languages` | Language-code collection for this chunk |
+| `page_content` | Entire extracted source-page text, shared by its chunks |
+| `page_embeddings` | Embedding of the entire source page, shared by its chunks |
+
+Managed index projections additionally require the technical `parent_id` field.
+The schema and projections include all eleven fields. Page content, page summary,
+and page vector are repeated on every chunk of that page; they are not computed
+from a single chunk. Both vector fields have the same dimensions and profile.
 
 ## Prerequisites and boundaries
 
@@ -35,6 +92,10 @@ that source file: it is a deployment dependency, not an extra step to run.
   container. These scripts do not create the Search service or document account.
 - Existing embedding and summary deployments. The summary deployment must support
   the Responses API. Use deployment names from your environment.
+- Document Layout-compatible Search/Foundry regions. Beyond the free allowance,
+  attach a compatible multi-service Foundry billing resourceâ€”not an OpenAI-only
+  resource. Key-based billing requires matching regions. See
+  [Layout requirements](docs/operations.md#document-layout-requirements).
 - Permission to configure Search, create Function hosting, and assign narrowly
   scoped data-plane roles. See [permissions](docs/operations.md#permissions).
 - Approval for billable Function hosting, model calls, and indexing.
@@ -50,12 +111,22 @@ policies to run this example. See [hosting constraints](docs/operations.md#hosti
 Run all commands from this repository directory. Existing process environment
 variables take precedence over the local configuration file.
 
+**Use existing Blobs for the current workflow.** Run the master with `-SkipUpload`:
+Azure Search reads the documents directly from the configured container. Each
+approved Blob must already have the configured tenant metadata field and
+`file_id`. No local document path or manual indexing script is needed.
+
+The page-first pipeline above preserves all eleven fields. Full-page summary and
+embedding skills run on the page before Text Split creates its chunks. Index
+projections copy those page-level values onto each corresponding chunk. The
+numbering Function remains a small adapter; it does not ingest or crack documents.
+
 | Step | Script | When to run |
 |---|---|---|
-| 00 | [00_configure_environment.ps1](00_configure_environment.ps1) | Configure local settings |
+| 00 | [00_configure_environment.ps1](rag_search/00_configure_environment.ps1) | Configure local settings |
 | 01 | [01_upload_document.py](rag_search/01_upload_document.py) | Upload a document, unless an approved Blob already has the required metadata |
 | 02 | [02_create_index.py](rag_search/02_create_index.py) | Create or update the search index |
-| 03 | [03_deploy_custom_skill.ps1](03_deploy_custom_skill.ps1) | Validate and deploy the enrichment Function |
+| 03 | [03_deploy_custom_skill.ps1](rag_search/03_deploy_custom_skill.ps1) | Deploy both functions in one Function App |
 | 04 | [04_create_indexer.py](rag_search/04_create_indexer.py) | Configure managed indexing and enable its initial run |
 | 05 | [05_run_indexer.py](rag_search/05_run_indexer.py) | Optional: request an extra run |
 | 06 | [06_search.py](rag_search/06_search.py) | Search after indexing completes |
@@ -64,15 +135,14 @@ variables take precedence over the local configuration file.
 
 The [master script](run_all.ps1) calls the numbered scripts in order and prints
 timestamped `RUNNING`, `OK`, `SKIPPED`, `FAILED`, and `COMPLETE` messages. Define
-the `$deployment` parameters shown in step 3 below, then run:
+`$deployment` as shown in step 3 below, then run:
 
 ```powershell
 # Print the plan only: no installation, configuration changes, or Azure calls.
-.\run_all.ps1 @deployment -WhatIf
-# Run after reviewing the plan; asks for confirmation before making changes.
-.\run_all.ps1 @deployment
-# Alternatively, use an already-approved Blob with tenant/file metadata:
+.\run_all.ps1 @deployment -SkipUpload -WhatIf
+# Use already-approved Blobs; asks for confirmation before making changes.
 .\run_all.ps1 @deployment -SkipUpload
+# Optional later: omit -SkipUpload to upload a local document through step 01.
 ```
 
 The master script prepares a missing virtual environment and dependencies,
@@ -99,7 +169,7 @@ The sections below explain the same steps individually.
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -c constraints.txt -e ".[function]"
 az login
-.\00_configure_environment.ps1 -IncludeUpload
+.\rag_search\00_configure_environment.ps1 -IncludeUpload
 ```
 
 Alternatively, copy [.env.example](.env.example) to `.env` and supply your own
@@ -107,11 +177,13 @@ values. Never commit or share the populated file. The constraints capture the
 tested Windows/Python 3.12 environment; they are not a guarantee of other-platform
 compatibility or a lock of Azure's remote build.
 
-For a shareable first run, use the original [sample document](samples/sample.txt):
+For a shareable first run, use the original two-page [sample PDF](samples/sample.pdf).
+Its original text is also available in [sample.txt](samples/sample.txt).
+Plain text and Markdown are not supported by this managed Layout skill:
 
 ```dotenv
-RAG_LOCAL_FILE_PATH='samples\sample.txt'
-RAG_BLOB_NAME=sample.txt
+RAG_LOCAL_FILE_PATH='samples\sample.pdf'
+RAG_BLOB_NAME=sample.pdf
 RAG_TENANT_ID=demo-tenant
 AZURE_SEARCH_TENANT_METADATA_FIELD=tenant_id
 ```
@@ -131,11 +203,11 @@ writes `tenant_id`, the configured tenant alias, and a stable generated `file_id
 Ingestion reads those metadata IDs unchanged. Changing identity metadata can leave
 old indexed records; cleanup is not automatic.
 
-### 3. Validate and deploy the Function
+### 3. Validate and deploy both functions in one app
 
-Supply your own names and ARM resource IDs. The source Storage account must match
-the upload/indexer settings. Both model deployments must belong to the supplied
-model resource. Host storage is a separate account, not the document account.
+Supply your own names and the summary model's ARM resource ID. The embedding
+deployment belongs to the endpoint in `.env`; Search needs its own role there.
+Host storage is a separate account, not the document account.
 
 ```powershell
 $deployment = @{
@@ -143,25 +215,27 @@ $deployment = @{
     Location = '<supported-consumption-region>'
     FunctionAppName = '<globally-unique-function-name>'
     FunctionStorageAccountName = '<globallyuniquestoragename>'
-    SourceStorageResourceId = '<accepted-blob-storage-account-arm-id>'
-    OpenAIResourceId = '<resource-hosting-both-model-deployments-arm-id>'
+    OpenAIResourceId = '<resource-hosting-summary-deployment-arm-id>'
     SubscriptionId = '<subscription-id>'
 }
-
 # Local packaging checks; no Azure calls.
-.\03_deploy_custom_skill.ps1 @deployment -WhatIf
+.\rag_search\03_deploy_custom_skill.ps1 @deployment -WhatIf
 # Read-only Azure prerequisite checks.
-.\03_deploy_custom_skill.ps1 @deployment -PreflightOnly
+.\rag_search\03_deploy_custom_skill.ps1 @deployment -PreflightOnly
 # After reviewing the checks and billable resources:
-.\03_deploy_custom_skill.ps1 @deployment
+.\rag_search\03_deploy_custom_skill.ps1 @deployment
 ```
 
 No switch changes network settings or organization policies. Use
-`Get-Help .\03_deploy_custom_skill.ps1 -Full` for parameter details.
+`Get-Help .\rag_search\03_deploy_custom_skill.ps1 -Full` for parameter details.
 
 This step packages the Function, reuses only script-owned hosting resources,
-assigns its Blob-reader/model roles, and verifies its authenticated route and
-trigger registration. Do not continue if it fails.
+assigns the app's summary-model role, and verifies both authenticated routes and
+trigger registration. Numbering makes no Storage-data or model calls. Both
+functions share the existing app and host storage; no second app is needed.
+Both endpoint/key pairs are saved locally without printing keys. Deployment
+publishes the whole package, retaining the summary function alongside numbering.
+Do not continue if either route fails.
 
 ### 4. Configure indexing and verify completion
 
@@ -171,11 +245,13 @@ trigger registration. Do not continue if it fails.
 
 This enables processing immediately and schedules daily runs. It processes the
 accepted container, not just the sample file. Review the container first.
-The default language-detection allowance is 20 documents per indexer per day;
+The default Layout/language-detection allowance is 20 documents per indexer per day;
 larger workloads require the optional billing configuration.
 
 Verify a completed run with zero failed items in the Search indexer's execution
-history, then inspect the indexed tenant/file IDs, page summaries, and languages.
+history, then inspect the indexed tenant/file IDs, physical `page_number`, chunk
+numbers restarting per page, full-page content/summaries, both vectors, and languages.
+The sample PDF should produce content from pages 1 and 2.
 Configuration success is not indexing success. For an extra run only:
 
 ```powershell
@@ -203,6 +279,30 @@ and apply authorization on every query; a caller-supplied tenant ID is not enoug
 
 ## Limits and maintenance
 
+**Migrating from the earlier page-enrichment example:** select a new
+`AZURE_SEARCH_INDEX`, `AZURE_SEARCH_INDEXER_NAME`, and `AZURE_SEARCH_SKILLSET_NAME`.
+Pause the old indexer and wait for active work **before replacing the same Function**;
+the master only pauses the indexer currently named in `.env`.
+The old and new Function contracts are incompatible. The new pipeline preserves
+all eleven fields, summarizes and embeds whole pages, and additionally embeds chunks.
+No script deletes old records,
+resets an index, revokes old roles, or removes obsolete Function app settings.
+See the [migration checklist](docs/operations.md#schema-migration).
+
+The [manual alternative](rag_search/alternative_ingest_document.py) is retained
+for reference, but is not part of the current workflow and is never called by the
+master. It writes the same eleven business fields directly. It uses Python character
+windows (5,000/750), rather than Search's sentence-aware Text Split. Python counts
+Unicode code points; service character accounting can differ for supplementary
+characters. It supports text PDFs, text, and HTML, not Layout's OCR/Office coverage.
+Set `AZURE_LANGUAGE_ENDPOINT` and `RAG_BLOB_NAME` for this route and run it after
+script 02; do not mix manual and managed ingestion for the same corpus.
+
+Full pages are never silently truncated: summary input is limited to 50,000
+Python characters, and the embedding model's input-token limit also applies.
+Oversized pages fail indexing and require deliberate preparation, not fake
+page values copied from a chunk.
+
 - Large-document processing, private networking, identity-based host storage,
   and safe identity-migration cleanup remain future work. See the
   [operational limits](docs/operations.md#known-limitations).
@@ -211,7 +311,7 @@ and apply authorization on every query; a caller-supplied tenant ID is not enoug
 
 ## What is published
 
-This minimal repository contains the master and managed-route scripts, Function source,
+This minimal repository contains the master, managed and manual scripts, both Function sources,
 dependency files, configuration example, short operations guide, license, and
 original sample document. The explicit [.gitignore](.gitignore) allowlist excludes
 private configuration, customer data, local deployment notes, notebooks, tests,
