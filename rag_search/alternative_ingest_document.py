@@ -1,11 +1,9 @@
-"""Alternative ingestion: enrich and upload one accepted Blob directly from Python.
+"""Alternative ingestion: populate the same eleven-field contract directly from Python.
 
-This is an alternative to managed indexer ingestion, not another required step.
-Extract physical pages, split them into chunks, generate page summaries and
+Extract physical pages, split them into overlapping character-based chunks, generate page summaries and
 page/chunk embeddings, detect languages, and upload complete Search records.
 For the same tenant/file, upload the new generation before removing stale chunks.
-The deployment script also packages this module as ingestion.py for the Function
-to reuse its extraction and enrichment logic without running main().
+The summary-only Function does not import or package this module.
 """
 
 import hashlib
@@ -60,7 +58,7 @@ class Page:
 
 @dataclass(frozen=True)
 class Chunk:
-    """A page-bounded passage with a document-wide sequence number and full source-page text."""
+    """A passage with a per-page sequence number and the full source-page text."""
 
     page_number: int
     number: int
@@ -76,9 +74,7 @@ class EnrichedPage:
     embedding: list[float]
 
 
-def read_blob_identity(
-    metadata: Mapping[str, str], tenant_metadata_field: str
-) -> tuple[str, str]:
+def read_blob_identity(metadata: Mapping[str, str], tenant_metadata_field: str) -> tuple[str, str]:
     """Read trusted tenant and file IDs from Blob metadata without generating defaults.
 
     The tenant key is configured; the file key is always file_id. Uploaders must
@@ -209,59 +205,28 @@ def extract_pages(blob_name: str, data: bytes) -> list[Page]:
     return pages
 
 
-def chunk_pages(
-    pages: list[Page], max_tokens: int = 512, encoding_name: str = "cl100k_base"
-) -> list[Chunk]:
-    """Split page text into token-bounded passages without crossing page boundaries.
+def chunk_pages(pages: list[Page], chunk_size: int = 5000, overlap: int = 750) -> list[Chunk]:
+    """Split each full page into overlapping character windows, numbered from 1.
 
-    Prefer paragraph and word boundaries. Preserve the source page number and
-    full page text on each chunk; number chunks from 1 across the whole document.
+    Keep the original text, including whitespace, so overlap and page content are
+    not changed by trimming. Never cross a physical page boundary.
     """
-    if max_tokens <= 0:
-        raise InputError("max_tokens must be positive")
-    encoding = tiktoken.get_encoding(encoding_name)
-
-    def token_count(text: str) -> int:
-        """Count text tokens using the encoding selected for the embedding model."""
-        return len(encoding.encode(text, disallowed_special=()))
-
+    if chunk_size <= 0 or not 0 <= overlap < chunk_size:
+        raise InputError("Chunk size must be positive and overlap smaller than chunk size")
     chunks: list[Chunk] = []
     for page in pages:
-        current = ""
-        for paragraph in re.split(r"\n\s*\n", page.content.strip()):
-            paragraph = paragraph.strip()
-            if not paragraph:
-                continue
-            candidate = f"{current}\n\n{paragraph}" if current else paragraph
-            if token_count(candidate) <= max_tokens:
-                current = candidate
-                continue
-            if current:
-                chunks.append(Chunk(page.number, len(chunks) + 1, current, page.content))
-                current = ""
-            while token_count(paragraph) > max_tokens:
-                low, high = 0, len(paragraph)
-                while low < high:
-                    middle = (low + high + 1) // 2
-                    if token_count(paragraph[:middle]) <= max_tokens:
-                        low = middle
-                    else:
-                        high = middle - 1
-                if low == 0:
-                    raise InputError("Token limit is too small for a single source character")
-                boundary = paragraph.rfind(" ", 0, low + 1)
-                end = boundary if boundary > 0 else low
-                text = paragraph[:end].strip()
-                while text and token_count(text) > max_tokens:
-                    end -= 1
-                    text = paragraph[:end].strip()
-                if not text:
-                    raise InputError("Token limit is too small for a source text fragment")
-                chunks.append(Chunk(page.number, len(chunks) + 1, text, page.content))
-                paragraph = paragraph[end:].strip()
-            current = paragraph
-        if current:
-            chunks.append(Chunk(page.number, len(chunks) + 1, current, page.content))
+        if not page.content.strip():
+            raise InputError("Each page must contain extractable text")
+        start, number = 0, 1
+        while start < len(page.content):
+            end = min(start + chunk_size, len(page.content))
+            text = page.content[start:end]
+            if text.strip():
+                chunks.append(Chunk(page.number, number, text, page.content))
+                number += 1
+            if end == len(page.content):
+                break
+            start = end - overlap
     if not chunks:
         raise InputError("Chunker produced no text")
     return chunks
@@ -372,28 +337,27 @@ def map_documents(
 ) -> list[dict[str, object]]:
     """Map chunks and vectors into Search records, copying supplied page enrichments.
 
-    Build generation-specific chunk keys for Python upload/replacement. Missing
-    optional page enrichment remains null; the real ingestion routes supply it.
-    The Function removes these keys before Search generates its projection keys.
+    Build generation-specific chunk keys for Python upload/replacement. Every
+    record requires full-page enrichment and detected language; no placeholders.
+    Managed index projections generate their own technical keys.
     """
     file_filter(tenant_id, file_id)
     if not chunks or len(chunks) != len(vectors) or dimensions <= 0:
         raise InputError("Chunk/vector count or dimension mismatch")
-    if languages is not None and (
-        len(languages) != len(chunks) or any(not codes for codes in languages)
-    ):
+    if languages is None or len(languages) != len(chunks) or any(not codes for codes in languages):
         raise InputError("Every chunk requires a detected language")
-    if page_enrichments is not None:
-        for chunk in chunks:
-            enrichment = page_enrichments.get(chunk.page_number)
-            if (
-                enrichment is None
-                or not enrichment.summary.strip()
-                or len(enrichment.embedding) != dimensions
-                or not all(math.isfinite(value) for value in enrichment.embedding)
-                or not any(enrichment.embedding)
-            ):
-                raise InputError("Every physical page requires a valid summary and embedding")
+    if page_enrichments is None:
+        raise InputError("Every physical page requires a valid summary and embedding")
+    for chunk in chunks:
+        enrichment = page_enrichments.get(chunk.page_number)
+        if (
+            enrichment is None
+            or not enrichment.summary.strip()
+            or len(enrichment.embedding) != dimensions
+            or not all(math.isfinite(value) for value in enrichment.embedding)
+            or not any(enrichment.embedding)
+        ):
+            raise InputError("Every physical page requires a valid summary and embedding")
     generation = hashlib.sha256(
         json.dumps(
             [
@@ -425,13 +389,9 @@ def map_documents(
                 "chunk_content": chunk.content,
                 "embeddings": vector,
                 "page_content": chunk.page_content,
-                "page_summary": (
-                    page_enrichments[chunk.page_number].summary if page_enrichments else None
-                ),
-                "page_embeddings": (
-                    page_enrichments[chunk.page_number].embedding if page_enrichments else None
-                ),
-                "languages": languages[position] if languages is not None else [],
+                "page_summary": page_enrichments[chunk.page_number].summary,
+                "page_embeddings": page_enrichments[chunk.page_number].embedding,
+                "languages": languages[position],
             }
         )
     if len({document["chunk_id"] for document in documents}) != len(documents):
@@ -615,8 +575,8 @@ def main() -> None:
     max_bytes = positive_int("RAG_MAX_BLOB_BYTES", 25 * 1024 * 1024)
     chunker = partial(
         chunk_pages,
-        max_tokens=positive_int("RAG_CHUNK_TOKENS", 512),
-        encoding_name=os.environ.get("RAG_TOKENIZER_ENCODING", "cl100k_base"),
+        chunk_size=positive_int("AZURE_SEARCH_SPLIT_LENGTH", 5000),
+        overlap=int(os.environ.get("AZURE_SEARCH_SPLIT_OVERLAP", "750")),
     )
     credential = get_credential()
     with credential, SearchIndexClient(search_endpoint, credential) as indexes:
@@ -630,7 +590,7 @@ def main() -> None:
             )
         page_vector = fields.get("page_embeddings")
         if page_vector is None or page_vector.vector_search_dimensions != dimensions:
-            raise InputError("Page/chunk vector dimensions differ; run script 02")
+            raise InputError("Page/chunk vectors must have matching dimensions; run script 02")
         with (
             OpenAI(
                 base_url=f"{openai_endpoint}/openai/v1/",

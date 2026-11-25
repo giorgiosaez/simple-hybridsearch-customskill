@@ -84,7 +84,15 @@ def build_blob_metadata(
     if (
         not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tenant_metadata_field)
         or tenant_metadata_field.lower().startswith("metadata_storage_")
-        or tenant_metadata_field.lower() in ("content", "chunks", "file_id")
+        or tenant_metadata_field.lower()
+        in (
+            "content",
+            "chunks",
+            "pages",
+            "identified_content",
+            "file_data",
+            "file_id",
+        )
     ):
         raise InputError("Choose a valid, nonconflicting tenant metadata field name")
 
@@ -94,8 +102,10 @@ def build_blob_metadata(
         tenant_metadata_field: tenant_id,
     }
     for value in metadata.values():
-        if not value.strip() or not value.isascii() or any(
-            ord(char) < 32 or ord(char) == 127 for char in value
+        if (
+            not value.strip()
+            or not value.isascii()
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
         ):
             raise InputError(
                 "Tenant ID and generated file ID must be nonempty ASCII without control characters"

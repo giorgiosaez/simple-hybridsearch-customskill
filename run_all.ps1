@@ -4,13 +4,15 @@ Run the numbered managed-indexing examples from setup through search.
 .DESCRIPTION
 Prepares missing local dependencies and configuration, validates deployment,
 pauses any existing indexer, uploads an approved document, creates the index,
-deploys the Function, configures indexing, waits for a new successful run, and
+deploys summary and numbering functions in one app, configures indexing, waits for a new successful run, and
 searches. Stops on errors or indexing warnings. Prints phase status, not settings.
 Creates billable Azure resources and overwrites the selected Blob. Uses existing
 process environment values before .env. Search output contains document passages.
 If a later step fails, earlier changes persist and the indexer may remain paused.
 .PARAMETER SkipUpload
 Use an existing approved Blob with tenant/file metadata instead of step 01.
+The Search indexer still reads and processes the configured Blob container.
+This does not skip ingestion and does not invoke the manual indexing alternative.
 .PARAMETER TimeoutSeconds
 Maximum wait for each indexer pause/completion phase; defaults to 1800 seconds.
 .PARAMETER ResourceGroup
@@ -21,16 +23,14 @@ Azure region for Function hosting, passed to step 03.
 Globally unique Function App name, passed to step 03.
 .PARAMETER FunctionStorageAccountName
 Separate host-storage account name, passed to step 03.
-.PARAMETER SourceStorageResourceId
-ARM resource ID of accepted-document Storage, passed to step 03.
 .PARAMETER OpenAIResourceId
-ARM resource ID hosting both model deployments, passed to step 03.
+ARM resource ID hosting the summary deployment, passed to step 03.
 .PARAMETER SubscriptionId
 Azure subscription for deployment. If omitted, use the signed-in CLI subscription.
 .EXAMPLE
-.\run_all.ps1 @deployment -WhatIf
+.\run_all.ps1 @deployment -SkipUpload -WhatIf
 .EXAMPLE
-.\run_all.ps1 @deployment
+.\run_all.ps1 @deployment -SkipUpload
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
@@ -38,7 +38,6 @@ param(
     [Parameter(Mandatory = $true)][string]$Location,
     [Parameter(Mandatory = $true)][string]$FunctionAppName,
     [Parameter(Mandatory = $true)][string]$FunctionStorageAccountName,
-    [Parameter(Mandatory = $true)][string]$SourceStorageResourceId,
     [Parameter(Mandatory = $true)][string]$OpenAIResourceId,
     [string]$SubscriptionId,
     [switch]$SkipUpload,
@@ -99,7 +98,7 @@ try {
     }
     if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.env'))) {
         Write-Status 'INPUT' '00_configure_environment.ps1 will collect your resource settings.'
-        & (Join-Path $PSScriptRoot '00_configure_environment.ps1') -IncludeUpload:(-not $SkipUpload)
+        & (Join-Path $PSScriptRoot 'rag_search\00_configure_environment.ps1') -IncludeUpload:(-not $SkipUpload)
     } else {
         Write-Status 'OK' 'Reusing .env without overwriting it; existing process variables take precedence.'
     }
@@ -109,14 +108,13 @@ try {
         Location = $Location
         FunctionAppName = $FunctionAppName
         FunctionStorageAccountName = $FunctionStorageAccountName
-        SourceStorageResourceId = $SourceStorageResourceId
         OpenAIResourceId = $OpenAIResourceId
     }
     if ($SubscriptionId) { $deployment.SubscriptionId = $SubscriptionId }
 
     $phase = '03 deployment preflight (read-only Azure checks)'
     Write-Status 'RUNNING' $phase
-    & (Join-Path $PSScriptRoot '03_deploy_custom_skill.ps1') @deployment -PreflightOnly -Confirm:$false
+    & (Join-Path $PSScriptRoot 'rag_search\03_deploy_custom_skill.ps1') @deployment -PreflightOnly -Confirm:$false
     Write-Status 'OK' $phase
 
     $phase = 'pause existing indexing before changing documents or deployment'
@@ -129,9 +127,9 @@ try {
     $phase = '02 index definition'
     Invoke-Example '02_create_index.py'
 
-    $phase = '03 Function deployment'
+    $phase = '03 shared summary and numbering Function App deployment'
     Write-Status 'RUNNING' $phase
-    & (Join-Path $PSScriptRoot '03_deploy_custom_skill.ps1') @deployment -Confirm:$false
+    & (Join-Path $PSScriptRoot 'rag_search\03_deploy_custom_skill.ps1') @deployment -Confirm:$false
     Write-Status 'OK' $phase
 
     $phase = '04 managed indexing configuration'
