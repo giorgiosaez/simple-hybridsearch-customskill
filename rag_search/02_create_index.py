@@ -128,10 +128,7 @@ def probe_embedding_size(
         raise InputError("The embedding vector contains only zeros")
 
     actual_embedding_size = len(vector)
-    if (
-        configured_embedding_size is not None
-        and actual_embedding_size != configured_embedding_size
-    ):
+    if configured_embedding_size is not None and actual_embedding_size != configured_embedding_size:
         raise InputError("The embedding service returned a dimension mismatch")
     return actual_embedding_size
 
@@ -139,7 +136,8 @@ def probe_embedding_size(
 def build_index(index_name: str, embedding_size: int) -> SearchIndex:
     """Describe one search document per chunk, without making Azure calls.
 
-    Each chunk stores identifiers, text, page metadata, and two embedding vectors.
+    Each chunk stores Blob identifiers, page/chunk numbers, text, language, and a
+    chunk embedding, plus its full source page's content, summary, and embedding.
     HNSW finds nearby vectors using cosine similarity; semantic ranking uses
     chunk_content to rerank text matches.
     """
@@ -148,7 +146,7 @@ def build_index(index_name: str, embedding_size: int) -> SearchIndex:
 
     # Field definitions are like database columns, not actual document values.
     fields = [
-        # Identifiers and document position
+        # Blob identifiers and Search-generated keys
         SearchableField(
             name="chunk_id",
             type=SearchFieldDataType.String,
@@ -160,9 +158,17 @@ def build_index(index_name: str, embedding_size: int) -> SearchIndex:
         SimpleField(name="tenant_id", type=SearchFieldDataType.String, filterable=True),
         SimpleField(name="file_id", type=SearchFieldDataType.String, filterable=True),
         SimpleField(
-            name="page_number", type=SearchFieldDataType.Int32, filterable=True, sortable=True
+            name="page_number",
+            type=SearchFieldDataType.Int32,
+            filterable=True,
+            sortable=True,
         ),
-        SimpleField(name="chunk_number", type=SearchFieldDataType.Int32, sortable=True),
+        SimpleField(
+            name="chunk_number",
+            type=SearchFieldDataType.Int32,
+            filterable=True,
+            sortable=True,
+        ),
         # Text and language metadata
         SearchableField(name="chunk_content", type=SearchFieldDataType.String),
         SearchableField(name="page_summary", type=SearchFieldDataType.String),
@@ -175,7 +181,6 @@ def build_index(index_name: str, embedding_size: int) -> SearchIndex:
         ),
     ]
 
-    # Embedding vectors
     for vector_name in ("embeddings", "page_embeddings"):
         fields.append(
             SearchField(

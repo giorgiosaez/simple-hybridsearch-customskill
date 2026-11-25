@@ -1,7 +1,7 @@
 """06: Search the configured index without tenant filtering.
 
 Run keyword, vector, or hybrid retrieval and print source passages, page
-summaries, identifiers, and scores. Vector/hybrid modes embed the query first;
+page summaries, identifiers, and scores. Vector/hybrid modes embed the query first;
 optional semantic ranking applies to keyword/hybrid mode. Results can span
 tenants, so this example is for trusted operators, not end-user authorization.
 """
@@ -177,6 +177,7 @@ def search_documents(
             "chunk_number",
             "languages",
             "page_summary",
+            "page_content",
         ],
         top=top_k,
     )
@@ -189,7 +190,8 @@ def search_documents(
             "page_number": result["page_number"],
             "chunk_number": result["chunk_number"],
             "languages": result.get("languages"),
-            "page_summary": result.get("page_summary"),
+            "page_summary": result["page_summary"],
+            "page_content": result["page_content"],
             "score": result.get("@search.score"),
             "reranker_score": result.get("@search.reranker_score"),
         }
